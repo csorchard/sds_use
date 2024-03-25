@@ -2,8 +2,8 @@ package blockio
 
 import (
 	hll "github.com/axiomhq/hyperloglog"
-	"sds_use/hyperloglog/containers"
-	"sds_use/hyperloglog/objectio"
+	"sds_use/hyperloglog/b_objectio"
+	"sds_use/hyperloglog/d_containers"
 )
 
 type ObjectColumnMetasBuilder struct {

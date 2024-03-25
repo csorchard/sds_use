@@ -1,7 +1,7 @@
 package index
 
 import (
-	"sds_use/hyperloglog/containers"
+	"sds_use/hyperloglog/d_containers"
 )
 
 type StaticFilter interface {

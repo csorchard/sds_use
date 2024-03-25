@@ -1,6 +1,6 @@
 package objectio
 
-import "sds_use/hyperloglog/types"
+import "sds_use/hyperloglog/e_types"
 
 const (
 	ndvOff = 0

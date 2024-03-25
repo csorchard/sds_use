@@ -1,7 +1,7 @@
 package objectio
 
 import (
-	"sds_use/hyperloglog/containers/batch"
+	"sds_use/hyperloglog/d_containers/batch"
 )
 
 type ObjectWriter struct {

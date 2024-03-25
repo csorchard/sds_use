@@ -1,9 +1,9 @@
 package blockio
 
 import (
-	"sds_use/hyperloglog/containers/batch"
-	"sds_use/hyperloglog/index"
-	"sds_use/hyperloglog/objectio"
+	"sds_use/hyperloglog/b_objectio"
+	"sds_use/hyperloglog/c_index"
+	"sds_use/hyperloglog/d_containers/batch"
 )
 
 type BlockWriter struct {
