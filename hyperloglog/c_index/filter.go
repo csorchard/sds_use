@@ -4,6 +4,8 @@ import (
 	"sds_use/hyperloglog/d_containers"
 )
 
+// StaticFilter is a filter that can be used to check if a key may be in a set.
+// It is methods of BloomFilter and CuckooFilter.
 type StaticFilter interface {
 	MayContainsKey(key []byte) (bool, error)
 	Marshal() ([]byte, error)
