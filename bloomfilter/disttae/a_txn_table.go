@@ -42,7 +42,8 @@ type txnTable struct {
 //     1>.Raw batch data resides in t     xn.writes,read by partitionReader.
 //     2>.CN blocks resides in S3, read by blockReader.
 
-// return all unmodified blocks
+// Ranges : return all unmodified blocks
+// NOTE: one entry point
 func (tbl *txnTable) Ranges(ctx context.Context, exprs []*plan.Expr) (ranges engine.Ranges, err error) {
 	// make sure we have the block infos snapshot
 	if err = tbl.UpdateObjectInfos(ctx); err != nil {
@@ -351,7 +352,21 @@ func (tbl *txnTable) tryFastFilterBlocks(
 	dirtyBlocks map[types.Blockid]struct{},
 	outBlocks *objectio.BlockInfoSlice,
 	fs fileservice.FileService) (done bool, err error) {
-	return false, nil
+	// TODO: refactor this code if composite key can be pushdown
+	if tbl.tableDef.Pkey == nil || tbl.tableDef.Pkey.CompPkeyCol == nil {
+		return TryFastFilterBlocks(
+			tbl.db.txn.op.SnapshotTS(),
+			tbl.tableDef,
+			exprs,
+			snapshot,
+			uncommittedObjects,
+			dirtyBlocks,
+			outBlocks,
+			fs,
+			tbl.proc.Load(),
+		)
+	}
+	return
 }
 
 func (tbl *txnTable) GetTableDef(ctx context.Context) *plan.TableDef {

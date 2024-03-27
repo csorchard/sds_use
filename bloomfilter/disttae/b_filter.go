@@ -4,8 +4,10 @@ import (
 	"context"
 	"sds_use/bloomfilter/containers/types"
 	"sds_use/bloomfilter/containers/vector"
+	"sds_use/bloomfilter/disttae/logtailreplay"
 	"sds_use/bloomfilter/fileservice"
 	"sds_use/bloomfilter/pb/plan"
+	"sds_use/bloomfilter/pb/timestamp"
 	"sds_use/bloomfilter/process"
 	"sds_use/bloomfilter/tae/index"
 	objectio "sds_use/hyperloglog/b_objectio"
@@ -559,7 +561,6 @@ func CompileFilterExpr(
 			) (bool, bool, error) {
 				return false, blkMeta.MustGetColumn(uint16(seqNum)).NullCnt() < blkMeta.GetRows(), nil
 			}
-
 		case "in":
 			colExpr, val, ok := mustColVecValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
 			if !ok {
@@ -691,5 +692,286 @@ func CompileFilterExpr(
 	default:
 		canCompile = false
 	}
+	return
+}
+
+func CompileFilterExprs(
+	exprs []*plan.Expr,
+	proc *process.Process,
+	tableDef *plan.TableDef,
+	fs fileservice.FileService,
+) (
+	fastFilterOp FastFilterOp,
+	loadOp LoadOp,
+	objectFilterOp ObjectFilterOp,
+	blockFilterOp BlockFilterOp,
+	seekOp SeekFirstBlockOp,
+	canCompile bool,
+) {
+	canCompile = true
+	if len(exprs) == 0 {
+		return
+	}
+	if len(exprs) == 1 {
+		return CompileFilterExpr(exprs[0], proc, tableDef, fs)
+	}
+	ops1 := make([]FastFilterOp, 0, len(exprs))
+	ops2 := make([]LoadOp, 0, len(exprs))
+	ops3 := make([]ObjectFilterOp, 0, len(exprs))
+	ops4 := make([]BlockFilterOp, 0, len(exprs))
+	ops5 := make([]SeekFirstBlockOp, 0, len(exprs))
+
+	for _, expr := range exprs {
+		expr_op1, expr_op2, expr_op3, expr_op4, expr_op5, can := CompileFilterExpr(expr, proc, tableDef, fs)
+		if !can {
+			return nil, nil, nil, nil, nil, false
+		}
+		if expr_op1 != nil {
+			ops1 = append(ops1, expr_op1)
+		}
+		if expr_op2 != nil {
+			ops2 = append(ops2, expr_op2)
+		}
+		if expr_op3 != nil {
+			ops3 = append(ops3, expr_op3)
+		}
+		if expr_op4 != nil {
+			ops4 = append(ops4, expr_op4)
+		}
+		if expr_op5 != nil {
+			ops5 = append(ops5, expr_op5)
+		}
+	}
+	fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
+		for _, op := range ops1 {
+			ok, err := op(obj)
+			if err != nil || !ok {
+				return ok, err
+			}
+		}
+		return true, nil
+	}
+	loadOp = func(
+		ctx context.Context,
+		obj objectio.ObjectStats,
+		inMeta objectio.ObjectMeta,
+		inBF objectio.BloomFilter,
+	) (meta objectio.ObjectMeta, bf objectio.BloomFilter, err error) {
+		for _, op := range ops2 {
+			if meta != nil && bf != nil {
+				continue
+			}
+			if meta, bf, err = op(ctx, obj, meta, bf); err != nil {
+				return
+			}
+		}
+		return
+	}
+	objectFilterOp = func(meta objectio.ObjectMeta, bf objectio.BloomFilter) (bool, error) {
+		for _, op := range ops3 {
+			ok, err := op(meta, bf)
+			if !ok || err != nil {
+				return ok, err
+			}
+		}
+		return true, nil
+	}
+	blockFilterOp = func(
+		blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
+	) (bool, bool, error) {
+		ok := true
+		for _, op := range ops4 {
+			thisCan, thisOK, err := op(blkIdx, blkMeta, bf)
+			if err != nil {
+				return false, false, err
+			}
+			if thisCan {
+				return true, false, nil
+			}
+			ok = ok && thisOK
+		}
+		return false, ok, nil
+	}
+
+	seekOp = func(obj objectio.ObjectDataMeta) int {
+		var pos int
+		for _, op := range ops5 {
+			pos2 := op(obj)
+			if pos2 > pos {
+				pos = pos2
+			}
+		}
+		return pos
+	}
+	return
+}
+
+func TryFastFilterBlocks(
+	snapshotTS timestamp.Timestamp,
+	tableDef *plan.TableDef,
+	exprs []*plan.Expr,
+	snapshot *logtailreplay.PartitionState,
+	uncommittedObjects []objectio.ObjectStats,
+	dirtyBlocks map[types.Blockid]struct{},
+	outBlocks *objectio.BlockInfoSlice,
+	fs fileservice.FileService,
+	proc *process.Process,
+) (ok bool, err error) {
+	fastFilterOp, loadOp, objectFilterOp, blockFilterOp, seekOp, ok := CompileFilterExprs(exprs, proc, tableDef, fs)
+	if !ok {
+		return false, nil
+	}
+	err = ExecuteBlockFilter(
+		snapshotTS,
+		fastFilterOp,
+		loadOp,
+		objectFilterOp,
+		blockFilterOp,
+		seekOp,
+		snapshot,
+		uncommittedObjects,
+		dirtyBlocks,
+		outBlocks,
+		fs,
+		proc,
+	)
+	return true, err
+}
+
+func ExecuteBlockFilter(
+	snapshotTS timestamp.Timestamp,
+	fastFilterOp FastFilterOp,
+	loadOp LoadOp,
+	objectFilterOp ObjectFilterOp,
+	blockFilterOp BlockFilterOp,
+	seekOp SeekFirstBlockOp,
+	snapshot *logtailreplay.PartitionState,
+	uncommittedObjects []objectio.ObjectStats,
+	dirtyBlocks map[types.Blockid]struct{},
+	outBlocks *objectio.BlockInfoSlice,
+	fs fileservice.FileService,
+	proc *process.Process,
+) (err error) {
+
+	hasDeletes := len(dirtyBlocks) > 0
+	err = ForeachSnapshotObjects(
+		snapshotTS,
+		func(obj logtailreplay.ObjectInfo, isCommitted bool) (err2 error) {
+			var ok bool
+			objStats := obj.ObjectStats
+			if fastFilterOp != nil {
+				if ok, err2 = fastFilterOp(objStats); err2 != nil || !ok {
+					return
+				}
+			}
+			var (
+				meta objectio.ObjectMeta
+				bf   objectio.BloomFilter
+			)
+			if loadOp != nil {
+				if meta, bf, err2 = loadOp(
+					proc.Ctx, objStats, meta, bf,
+				); err2 != nil {
+					return
+				}
+			}
+			if objectFilterOp != nil {
+				if ok, err2 = objectFilterOp(meta, bf); err2 != nil || !ok {
+					return
+				}
+			}
+			var dataMeta objectio.ObjectDataMeta
+			if meta != nil {
+				dataMeta = meta.MustDataMeta()
+			}
+			var blockCnt int
+			if dataMeta != nil {
+				blockCnt = int(dataMeta.BlockCount())
+			} else {
+				blockCnt = int(objStats.BlkCnt())
+			}
+
+			name := objStats.ObjectName()
+			extent := objStats.Extent()
+
+			var pos int
+			if seekOp != nil {
+				pos = seekOp(dataMeta)
+			}
+
+			if objStats.Rows() == 0 {
+				logutil.Fatalf("object stats has zero rows, detail: %s", obj.String())
+			}
+
+			for ; pos < blockCnt; pos++ {
+				var blkMeta objectio.BlockObject
+				if dataMeta != nil && blockFilterOp != nil {
+					var (
+						quickBreak, ok2 bool
+					)
+					blkMeta = dataMeta.GetBlockMeta(uint32(pos))
+					if quickBreak, ok2, err2 = blockFilterOp(pos, blkMeta, bf); err2 != nil {
+						return
+
+					}
+					// skip the following block checks
+					if quickBreak {
+						break
+					}
+					// skip this block
+					if !ok2 {
+						continue
+					}
+				}
+				var rows uint32
+				if objRows := objStats.Rows(); objRows != 0 {
+					if pos < blockCnt-1 {
+						rows = options.DefaultBlockMaxRows
+					} else {
+						rows = objRows - options.DefaultBlockMaxRows*uint32(pos)
+					}
+				} else {
+					if blkMeta == nil {
+						blkMeta = dataMeta.GetBlockMeta(uint32(pos))
+					}
+					rows = blkMeta.GetRows()
+				}
+				loc := objectio.BuildLocation(name, extent, rows, uint16(pos))
+				blk := objectio.BlockInfo{
+					BlockID:   *objectio.BuildObjectBlockid(name, uint16(pos)),
+					SegmentID: name.SegmentId(),
+					MetaLoc:   objectio.ObjectLocation(loc),
+				}
+
+				blk.Sorted = obj.Sorted
+				blk.EntryState = obj.EntryState
+				blk.CommitTs = obj.CommitTS
+				if obj.HasDeltaLoc {
+					deltaLoc, commitTs, ok := snapshot.GetBockDeltaLoc(blk.BlockID)
+					if ok {
+						blk.DeltaLoc = deltaLoc
+						blk.CommitTs = commitTs
+					}
+				}
+
+				if hasDeletes {
+					if _, ok := dirtyBlocks[blk.BlockID]; !ok {
+						blk.CanRemote = true
+					}
+					blk.PartitionNum = -1
+					outBlocks.AppendBlockInfo(blk)
+					continue
+				}
+				// store the block in ranges
+				blk.CanRemote = true
+				blk.PartitionNum = -1
+				outBlocks.AppendBlockInfo(blk)
+			}
+
+			return
+		},
+		snapshot,
+		uncommittedObjects...,
+	)
 	return
 }
