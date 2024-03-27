@@ -1,6 +1,6 @@
 package blockio
 
-import "sds_use/bloomfilter/objectio"
+import "sds_use/bloomfilter/d_objectio"
 
 var pipeline *IoPipeline
 

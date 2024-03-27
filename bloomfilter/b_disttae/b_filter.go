@@ -2,14 +2,14 @@ package disttae
 
 import (
 	"context"
-	"sds_use/bloomfilter/containers/types"
-	"sds_use/bloomfilter/containers/vector"
-	"sds_use/bloomfilter/disttae/logtailreplay"
-	"sds_use/bloomfilter/fileservice"
-	"sds_use/bloomfilter/pb/plan"
-	"sds_use/bloomfilter/pb/timestamp"
-	"sds_use/bloomfilter/process"
-	"sds_use/bloomfilter/tae/index"
+	"sds_use/bloomfilter/b_disttae/logtailreplay"
+	"sds_use/bloomfilter/c_tae/index"
+	"sds_use/bloomfilter/e_fileservice"
+	"sds_use/bloomfilter/z_containers/types"
+	"sds_use/bloomfilter/z_containers/vector"
+	"sds_use/bloomfilter/z_pb/plan"
+	"sds_use/bloomfilter/z_pb/timestamp"
+	"sds_use/bloomfilter/z_process"
 	objectio "sds_use/hyperloglog/b_objectio"
 	"sort"
 )

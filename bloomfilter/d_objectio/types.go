@@ -1,6 +1,6 @@
 package objectio
 
-import "sds_use/bloomfilter/tae/index"
+import "sds_use/bloomfilter/c_tae/index"
 
 type ObjectMeta interface {
 }

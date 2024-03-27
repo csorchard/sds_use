@@ -1,6 +1,6 @@
 package vector
 
-import "sds_use/bloomfilter/containers/types"
+import "sds_use/bloomfilter/z_containers/types"
 
 // Vector represent a column
 type Vector struct {

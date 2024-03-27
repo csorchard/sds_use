@@ -1,10 +1,10 @@
 package colexec
 
 import (
-	"sds_use/bloomfilter/containers/vector"
-	"sds_use/bloomfilter/objectio"
-	"sds_use/bloomfilter/pb/plan"
-	"sds_use/bloomfilter/process"
+	"sds_use/bloomfilter/d_objectio"
+	"sds_use/bloomfilter/z_containers/vector"
+	"sds_use/bloomfilter/z_pb/plan"
+	"sds_use/bloomfilter/z_process"
 )
 
 func EvaluateFilterByZoneMap(

@@ -1,9 +1,9 @@
 package disttae
 
 import (
-	"sds_use/bloomfilter/disttae/logtailreplay"
-	"sds_use/bloomfilter/fileservice"
-	"sds_use/bloomfilter/txn/client"
+	"sds_use/bloomfilter/b_disttae/logtailreplay"
+	"sds_use/bloomfilter/c_txn/client"
+	"sds_use/bloomfilter/e_fileservice"
 )
 
 // txnDatabase represents an opened database in a transaction

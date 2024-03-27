@@ -1,6 +1,6 @@
 package index
 
-import "sds_use/bloomfilter/containers/vector"
+import "sds_use/bloomfilter/z_containers/vector"
 
 type ZM []byte
 

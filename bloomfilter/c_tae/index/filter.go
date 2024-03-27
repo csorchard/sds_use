@@ -1,7 +1,7 @@
 package index
 
 import (
-	"sds_use/bloomfilter/containers/vector"
+	"sds_use/bloomfilter/z_containers/vector"
 )
 
 type StaticFilter interface {

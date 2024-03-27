@@ -1,10 +1,10 @@
 package disttae
 
 import (
-	"sds_use/bloomfilter/disttae/logtailreplay"
-	"sds_use/bloomfilter/objectio"
-	"sds_use/bloomfilter/pb/plan"
-	"sds_use/bloomfilter/pb/timestamp"
+	"sds_use/bloomfilter/b_disttae/logtailreplay"
+	"sds_use/bloomfilter/d_objectio"
+	"sds_use/bloomfilter/z_pb/plan"
+	"sds_use/bloomfilter/z_pb/timestamp"
 )
 
 func extractPKValueFromEqualExprs(

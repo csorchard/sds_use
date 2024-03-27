@@ -1,7 +1,7 @@
 package logtailreplay
 
 import (
-	"sds_use/bloomfilter/pb/timestamp"
+	"sds_use/bloomfilter/z_pb/timestamp"
 	"sync/atomic"
 )
 

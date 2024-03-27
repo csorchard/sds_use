@@ -1,7 +1,7 @@
 package objectio
 
 import (
-	"sds_use/bloomfilter/containers/types"
+	"sds_use/bloomfilter/z_containers/types"
 	"unsafe"
 )
 
