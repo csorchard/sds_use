@@ -4,7 +4,7 @@ import (
 	"sds_use/bloomfilter/d_objectio"
 	"sds_use/bloomfilter/z_containers/vector"
 	"sds_use/bloomfilter/z_pb/plan"
-	"sds_use/bloomfilter/z_process"
+	"sds_use/bloomfilter/z_vm/process"
 )
 
 func EvaluateFilterByZoneMap(

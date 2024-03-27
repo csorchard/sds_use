@@ -2,17 +2,17 @@ package disttae
 
 import (
 	"context"
-	"sds_use/bloomfilter/a_sql/colexec"
+	"sds_use/bloomfilter/a_sql/b_colexec"
 	"sds_use/bloomfilter/b_disttae/logtailreplay"
-	"sds_use/bloomfilter/c_tae/blockio"
-	"sds_use/bloomfilter/c_tae/index"
+	"sds_use/bloomfilter/c_vm_tae/blockio"
+	"sds_use/bloomfilter/c_vm_tae/index"
 	"sds_use/bloomfilter/d_objectio"
 	"sds_use/bloomfilter/e_fileservice"
 	"sds_use/bloomfilter/z_containers/types"
 	"sds_use/bloomfilter/z_containers/vector"
 	"sds_use/bloomfilter/z_pb/plan"
-	"sds_use/bloomfilter/z_process"
 	"sds_use/bloomfilter/z_vm/engine"
+	"sds_use/bloomfilter/z_vm/process"
 	"sort"
 	"sync/atomic"
 )
@@ -27,23 +27,7 @@ type txnTable struct {
 	tableId        uint64
 }
 
-// txn can read :
-//  1. snapshot data:
-//      1>. committed block data resides in S3.
-//      2>. partition state data resides in memory. read by partitionReader.
-
-//      deletes(rowids) for committed block exist in the following four places:
-//      1. in delta location formed by TN writing S3. read by blockReader.
-//      2. in CN's partition state, read by partitionReader.
-//  	3. in txn's workspace(txn.writes) being deleted by txn, read by partitionReader.
-//  	4. in delta location being deleted through CN writing S3, read by blockMergeReader.
-
-//  2. data in txn's workspace:
-//     1>.Raw batch data resides in t     xn.writes,read by partitionReader.
-//     2>.CN blocks resides in S3, read by blockReader.
-
 // Ranges : return all unmodified blocks
-// NOTE: one entry point
 func (tbl *txnTable) Ranges(ctx context.Context, exprs []*plan.Expr) (ranges engine.Ranges, err error) {
 	// make sure we have the block infos snapshot
 	if err = tbl.UpdateObjectInfos(ctx); err != nil {
@@ -103,12 +87,6 @@ func (tbl *txnTable) rangesOnePart(
 	} else if done {
 		return nil
 	}
-
-	//// for dynamic parameter, substitute param ref and const fold cast expression here to improve performance
-	//newExprs, err := plan.ConstandFoldList(exprs, tbl.proc.Load(), true)
-	//if err == nil {
-	//	exprs = newExprs
-	//}
 
 	var (
 		zms      []objectio.ZoneMap

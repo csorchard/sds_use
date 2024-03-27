@@ -36,17 +36,17 @@ func ForeachSnapshotObjects(
 		return
 	}
 
-	iter, err := tableSnapshot.NewObjectsIter(types.TimestampToTS(ts))
-	if err != nil {
-		return
-	}
-	defer iter.Close()
-	for iter.Next() {
-		obj := iter.Entry()
-		if err = onObject(obj.ObjectInfo, true); err != nil {
-			return
-		}
-	}
+	//iter, err := tableSnapshot.NewObjectsIter(types.TimestampToTS(ts))
+	//if err != nil {
+	//	return
+	//}
+	//defer iter.Close()
+	//for iter.Next() {
+	//	obj := iter.Entry()
+	//	if err = onObject(obj.ObjectInfo, true); err != nil {
+	//		return
+	//	}
+	//}
 	return
 }
 
@@ -61,27 +61,27 @@ func ForeachBlkInObjStatsList(
 	onBlock func(blk objectio.BlockInfo, blkMeta objectio.BlockObject) bool,
 	objects ...objectio.ObjectStats,
 ) {
-	stop := false
-	objCnt := len(objects)
+	//stop := false
+	//objCnt := len(objects)
 
-	for idx := 0; idx < objCnt && !stop; idx++ {
-		iter := NewStatsBlkIter(&objects[idx], dataMeta)
-		pos := uint32(0)
-		for iter.Next() {
-			blk := iter.Entry()
-			var meta objectio.BlockObject
-			if !dataMeta.IsEmpty() {
-				meta = dataMeta.GetBlockMeta(pos)
-			}
-			pos++
-			if !onBlock(blk, meta) {
-				stop = true
-				break
-			}
-		}
-
-		if stop && next {
-			stop = false
-		}
-	}
+	//for idx := 0; idx < objCnt && !stop; idx++ {
+	//	iter := NewStatsBlkIter(&objects[idx], dataMeta)
+	//	pos := uint32(0)
+	//	for iter.Next() {
+	//		blk := iter.Entry()
+	//		var meta objectio.BlockObject
+	//		if !dataMeta.IsEmpty() {
+	//			meta = dataMeta.GetBlockMeta(pos)
+	//		}
+	//		pos++
+	//		if !onBlock(blk, meta) {
+	//			stop = true
+	//			break
+	//		}
+	//	}
+	//
+	//	if stop && next {
+	//		stop = false
+	//	}
+	//}
 }

@@ -9,3 +9,7 @@ func (bm BlockObject) MustGetColumn(seqnum uint16) ColumnMeta {
 func (bm BlockObject) GetRows() uint32 {
 	return 0
 }
+
+func (bm BlockObject) IsEmpty() bool {
+	return false
+}

@@ -1,8 +1,9 @@
 package objectio
 
-import "sds_use/bloomfilter/c_tae/index"
+import "sds_use/bloomfilter/c_vm_tae/index"
 
 type ObjectMeta interface {
+	MustDataMeta() ObjectDataMeta
 }
 
 type ZoneMap = index.ZM

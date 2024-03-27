@@ -15,3 +15,11 @@ func (o ObjectDataMeta) BlockCount() uint32 {
 func (o ObjectDataMeta) GetBlockMeta(u uint32) BlockObject {
 	return nil
 }
+
+func (o ObjectDataMeta) MustGetColumn(seqnum uint16) ColumnMeta {
+	//if seqnum > o.BlockHeader().MaxSeqnum() {
+	//	return BuildObjectColumnMeta()
+	//}
+	//return GetObjectColumnMeta(seqnum, o[headerLen:])
+	return nil
+}

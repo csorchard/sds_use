@@ -3,16 +3,28 @@ package disttae
 import (
 	"context"
 	"sds_use/bloomfilter/b_disttae/logtailreplay"
-	"sds_use/bloomfilter/c_tae/index"
+	"sds_use/bloomfilter/c_vm_tae/index"
+	objectio "sds_use/bloomfilter/d_objectio"
 	"sds_use/bloomfilter/e_fileservice"
 	"sds_use/bloomfilter/z_containers/types"
 	"sds_use/bloomfilter/z_containers/vector"
 	"sds_use/bloomfilter/z_pb/plan"
 	"sds_use/bloomfilter/z_pb/timestamp"
-	"sds_use/bloomfilter/z_process"
-	objectio "sds_use/hyperloglog/b_objectio"
+	"sds_use/bloomfilter/z_vm/process"
 	"sort"
 )
+
+type FastFilterOp func(objectio.ObjectStats) (bool, error)
+type LoadOp = func(
+	context.Context, objectio.ObjectStats, objectio.ObjectMeta, objectio.BloomFilter,
+) (objectio.ObjectMeta, objectio.BloomFilter, error)
+type ObjectFilterOp func(objectio.ObjectMeta, objectio.BloomFilter) (bool, error)
+type SeekFirstBlockOp func(objectio.ObjectDataMeta) int
+type BlockFilterOp func(int, objectio.BlockObject, objectio.BloomFilter) (bool, bool, error)
+type LoadOpFactory func(fileservice.FileService) LoadOp
+
+var loadMetadataAndBFOpFactory LoadOpFactory
+var loadMetadataOnlyOpFactory LoadOpFactory
 
 func CompileFilterExpr(
 	expr *plan.Expr,
@@ -31,667 +43,206 @@ func CompileFilterExpr(
 	if expr == nil {
 		return
 	}
-	switch exprImpl := expr.Expr.(type) {
-	// case *plan.Expr_Lit:
-	// case *plan.Expr_Col:
-	case *plan.Expr_F:
-		switch exprImpl.F.Func.ObjName {
-		case "or":
-			leftFastOp, leftLoadOp, leftObjectOp, leftBlockOp, leftSeekOp, leftCan := CompileFilterExpr(
-				exprImpl.F.Args[0], proc, tableDef, fs,
+
+	var exprImpl *plan.Expr_F // todo: populate this correctly
+	switch exprImpl.F.Func.ObjName {
+	case "prefix_eq":
+		colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
+		if !ok {
+			canCompile = false
+			return
+		}
+		colDef := getColDefByName(colExpr.Col.Name, tableDef)
+		_, isSorted := isSortedKey(colDef)
+		if isSorted {
+			fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
+				if obj.ZMIsEmpty() {
+					return true, nil
+				}
+				return obj.SortKeyZoneMap().PrefixEq(vals[0]), nil
+			}
+		}
+		loadOp = loadMetadataOnlyOpFactory(fs)
+		seqNum := colDef.Seqnum
+		objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
+			if isSorted {
+				return true, nil
+			}
+			dataMeta := meta.MustDataMeta()
+			return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixEq(vals[0]), nil
+		}
+		blockFilterOp = func(
+			_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
+		) (bool, bool, error) {
+			// TODO: define canQuickBreak
+			return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixEq(vals[0]), nil
+		}
+		// TODO: define seekOp
+	case "=":
+		colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
+		if !ok {
+			canCompile = false
+			return
+		}
+		colDef := getColDefByName(colExpr.Col.Name, tableDef)
+		isPK, isSorted := isSortedKey(colDef)
+		if isSorted {
+			fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
+				if obj.ZMIsEmpty() {
+					return true, nil
+				}
+				return obj.SortKeyZoneMap().ContainsKey(vals[0]), nil
+			}
+		}
+		if isPK {
+			loadOp = loadMetadataAndBFOpFactory(fs)
+		} else {
+			loadOp = loadMetadataOnlyOpFactory(fs)
+		}
+
+		seqNum := colDef.Seqnum
+		objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
+			if isSorted {
+				return true, nil
+			}
+			dataMeta := meta.MustDataMeta()
+			return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().ContainsKey(vals[0]), nil
+		}
+		blockFilterOp = func(
+			blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
+		) (bool, bool, error) {
+			var (
+				can, ok bool
 			)
-			if !leftCan {
-				return nil, nil, nil, nil, nil, false
-			}
-			rightFastOp, rightLoadOp, rightObjectOp, rightBlockOp, rightSeekOp, rightCan := CompileFilterExpr(
-				exprImpl.F.Args[1], proc, tableDef, fs,
-			)
-			if !rightCan {
-				return nil, nil, nil, nil, nil, false
-			}
-			if leftFastOp != nil || rightFastOp != nil {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if leftFastOp != nil {
-						if ok, err := leftFastOp(obj); ok || err != nil {
-							return ok, err
-						}
-					}
-					if rightFastOp != nil {
-						return rightFastOp(obj)
-					}
-					return true, nil
-				}
-			}
-			if leftLoadOp != nil || rightLoadOp != nil {
-				loadOp = func(
-					ctx context.Context,
-					obj objectio.ObjectStats,
-					inMeta objectio.ObjectMeta,
-					inBF objectio.BloomFilter,
-				) (meta objectio.ObjectMeta, bf objectio.BloomFilter, err error) {
-					if leftLoadOp != nil {
-						if meta, bf, err = leftLoadOp(ctx, obj, inMeta, inBF); err != nil {
-							return
-						}
-						inMeta = meta
-						inBF = bf
-					}
-					if rightLoadOp != nil {
-						meta, bf, err = rightLoadOp(ctx, obj, inMeta, inBF)
-					}
-					return
-				}
-			}
-			if leftObjectOp != nil || rightLoadOp != nil {
-				objectFilterOp = func(meta objectio.ObjectMeta, bf objectio.BloomFilter) (bool, error) {
-					if leftObjectOp != nil {
-						if ok, err := leftObjectOp(meta, bf); ok || err != nil {
-							return ok, err
-						}
-					}
-					if rightObjectOp != nil {
-						return rightObjectOp(meta, bf)
-					}
-					return true, nil
-				}
-
-			}
-			if leftBlockOp != nil || rightBlockOp != nil {
-				blockFilterOp = func(
-					blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-				) (bool, bool, error) {
-					can := true
-					ok := false
-					if leftBlockOp != nil {
-						if thisCan, thisOK, err := leftBlockOp(blkIdx, blkMeta, bf); err != nil {
-							return false, false, err
-						} else {
-							ok = ok || thisOK
-							can = can && thisCan
-						}
-					}
-					if rightBlockOp != nil {
-						if thisCan, thisOK, err := rightBlockOp(blkIdx, blkMeta, bf); err != nil {
-							return false, false, err
-						} else {
-							ok = ok || thisOK
-							can = can && thisCan
-						}
-					}
-					return can, ok, nil
-				}
-			}
-			if leftSeekOp != nil || rightBlockOp != nil {
-				seekOp = func(meta objectio.ObjectDataMeta) int {
-					var pos int
-					if leftSeekOp != nil {
-						pos = leftSeekOp(meta)
-					}
-					if rightSeekOp != nil {
-						pos2 := rightSeekOp(meta)
-						if pos2 < pos {
-							pos = pos2
-						}
-					}
-					return pos
-				}
-			}
-		case "and":
-			leftFastOp, leftLoadOp, leftObjectOp, leftBlockOp, leftSeekOp, leftCan := CompileFilterExpr(
-				exprImpl.F.Args[0], proc, tableDef, fs,
-			)
-			if !leftCan {
-				return nil, nil, nil, nil, nil, false
-			}
-			rightFastOp, rightLoadOp, rightObjectOp, rightBlockOp, rightSeekOp, rightCan := CompileFilterExpr(
-				exprImpl.F.Args[1], proc, tableDef, fs,
-			)
-			if !rightCan {
-				return nil, nil, nil, nil, nil, false
-			}
-			if leftFastOp != nil || rightFastOp != nil {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if leftFastOp != nil {
-						if ok, err := leftFastOp(obj); !ok || err != nil {
-							return ok, err
-						}
-					}
-					if rightFastOp != nil {
-						return rightFastOp(obj)
-					}
-					return true, nil
-				}
-			}
-			if leftLoadOp != nil || rightLoadOp != nil {
-				loadOp = func(
-					ctx context.Context,
-					obj objectio.ObjectStats,
-					inMeta objectio.ObjectMeta,
-					inBF objectio.BloomFilter,
-				) (meta objectio.ObjectMeta, bf objectio.BloomFilter, err error) {
-					if leftLoadOp != nil {
-						if meta, bf, err = leftLoadOp(ctx, obj, inMeta, inBF); err != nil {
-							return
-						}
-						inMeta = meta
-						inBF = bf
-					}
-					if rightLoadOp != nil {
-						meta, bf, err = rightLoadOp(ctx, obj, inMeta, inBF)
-					}
-					return
-				}
-			}
-			if leftObjectOp != nil || rightLoadOp != nil {
-				objectFilterOp = func(meta objectio.ObjectMeta, bf objectio.BloomFilter) (bool, error) {
-					if leftObjectOp != nil {
-						if ok, err := leftObjectOp(meta, bf); !ok || err != nil {
-							return ok, err
-						}
-					}
-					if rightObjectOp != nil {
-						return rightObjectOp(meta, bf)
-					}
-					return true, nil
-				}
-
-			}
-			if leftBlockOp != nil || rightBlockOp != nil {
-				blockFilterOp = func(
-					blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-				) (bool, bool, error) {
-					ok := true
-					if leftBlockOp != nil {
-						if thisCan, thisOK, err := leftBlockOp(blkIdx, blkMeta, bf); err != nil {
-							return false, false, err
-						} else {
-							if thisCan {
-								return true, false, nil
-							}
-							ok = ok && thisOK
-						}
-					}
-					if rightBlockOp != nil {
-						if thisCan, thisOK, err := rightBlockOp(blkIdx, blkMeta, bf); err != nil {
-							return false, false, err
-						} else {
-							if thisCan {
-								return true, false, nil
-							}
-							ok = ok && thisOK
-						}
-					}
-					return false, ok, nil
-				}
-			}
-			if leftSeekOp != nil || rightSeekOp != nil {
-				seekOp = func(meta objectio.ObjectDataMeta) int {
-					var pos int
-					if leftSeekOp != nil {
-						pos = leftSeekOp(meta)
-					}
-					if rightSeekOp != nil {
-						pos2 := rightSeekOp(meta)
-						if pos2 < pos {
-							pos = pos2
-						}
-					}
-					return pos
-				}
-			}
-		case "<=":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
+			zm := blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap()
 			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().AnyLEByValue(vals[0]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyLEByValue(vals[0]), nil
-			}
-			blockFilterOp = func(
-				blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				ok := blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyLEByValue(vals[0])
-				if isSorted {
-					return !ok, ok, nil
-				}
-				return false, ok, nil
-			}
-		case ">=":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().AnyGEByValue(vals[0]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyGEByValue(vals[0]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyGEByValue(vals[0]), nil
-			}
-			if isSorted {
-				seekOp = func(meta objectio.ObjectDataMeta) int {
-					blockCnt := int(meta.BlockCount())
-					blkIdx := sort.Search(blockCnt, func(j int) bool {
-						return meta.GetBlockMeta(uint32(j)).MustGetColumn(uint16(seqNum)).ZoneMap().AnyGEByValue(vals[0])
-					})
-					return blkIdx
-				}
-			}
-		case ">":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().AnyGTByValue(vals[0]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyGTByValue(vals[0]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyGTByValue(vals[0]), nil
-			}
-			if isSorted {
-				seekOp = func(meta objectio.ObjectDataMeta) int {
-					blockCnt := int(meta.BlockCount())
-					blkIdx := sort.Search(blockCnt, func(j int) bool {
-						return meta.GetBlockMeta(uint32(j)).MustGetColumn(uint16(seqNum)).ZoneMap().AnyGTByValue(vals[0])
-					})
-					return blkIdx
-				}
-			}
-		case "<":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().AnyLTByValue(vals[0]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyLTByValue(vals[0]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				ok := blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyLTByValue(vals[0])
-				if isSorted {
-					return !ok, ok, nil
-				}
-				return false, ok, nil
-			}
-		case "prefix_eq":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().PrefixEq(vals[0]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixEq(vals[0]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				// TODO: define canQuickBreak
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixEq(vals[0]), nil
-			}
-			// TODO: define seekOp
-		case "prefix_between":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().PrefixBetween(vals[0], vals[1]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixBetween(vals[0], vals[1]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				// TODO: define canQuickBreak
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixBetween(vals[0], vals[1]), nil
-			}
-			// TODO: define seekOp
-			// ok
-		case "between":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().Between(vals[0], vals[1]), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().Between(vals[0], vals[1]), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				// TODO: define canQuickBreak
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().Between(vals[0], vals[1]), nil
-			}
-			// TODO: define seekOp
-		case "prefix_in":
-			colExpr, val, ok := mustColVecValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			vec := vector.NewVec(types.T_any.ToType())
-			_ = vec.UnmarshalBinary(val)
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			_, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().PrefixIn(vec), nil
-				}
-			}
-			loadOp = loadMetadataOnlyOpFactory(fs)
-
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixIn(vec), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				// TODO: define canQuickBreak
-				if !blkMeta.IsEmpty() && !blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixIn(vec) {
-					return false, false, nil
-				}
-				return false, true, nil
-			}
-			// TODO: define seekOp
-			// ok
-		case "isnull", "is_null":
-			colExpr, _, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			fastFilterOp = nil
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).NullCnt() != 0, nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).NullCnt() != 0, nil
-			}
-
-			// ok
-		case "isnotnull", "is_not_null":
-			colExpr, _, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			fastFilterOp = nil
-			loadOp = loadMetadataOnlyOpFactory(fs)
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).NullCnt() < dataMeta.BlockHeader().Rows(), nil
-			}
-			blockFilterOp = func(
-				_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				return false, blkMeta.MustGetColumn(uint16(seqNum)).NullCnt() < blkMeta.GetRows(), nil
-			}
-		case "in":
-			colExpr, val, ok := mustColVecValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			vec := vector.NewVec(types.T_any.ToType())
-			_ = vec.UnmarshalBinary(val)
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			isPK, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().AnyIn(vec), nil
-				}
-			}
-			if isPK {
-				loadOp = loadMetadataAndBFOpFactory(fs)
-			} else {
-				loadOp = loadMetadataOnlyOpFactory(fs)
-			}
-
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyIn(vec), nil
-			}
-			blockFilterOp = func(
-				blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				// TODO: define canQuickBreak
-				if !blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyIn(vec) {
-					return false, false, nil
-				}
-				if isPK {
-					blkBf := bf.GetBloomFilter(uint32(blkIdx))
-					blkBfIdx := index.NewEmptyBinaryFuseFilter()
-					if err := index.DecodeBloomFilter(blkBfIdx, blkBf); err != nil {
-						return false, false, err
-					}
-					if exist := blkBfIdx.MayContainsAny(vec); !exist {
-						return false, false, nil
-					}
-				}
-				return false, true, nil
-			}
-			// TODO: define seekOp
-		case "=":
-			colExpr, vals, ok := mustColConstValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
-			if !ok {
-				canCompile = false
-				return
-			}
-			colDef := getColDefByName(colExpr.Col.Name, tableDef)
-			isPK, isSorted := isSortedKey(colDef)
-			if isSorted {
-				fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
-					if obj.ZMIsEmpty() {
-						return true, nil
-					}
-					return obj.SortKeyZoneMap().ContainsKey(vals[0]), nil
-				}
-			}
-			if isPK {
-				loadOp = loadMetadataAndBFOpFactory(fs)
-			} else {
-				loadOp = loadMetadataOnlyOpFactory(fs)
-			}
-
-			seqNum := colDef.Seqnum
-			objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
-				if isSorted {
-					return true, nil
-				}
-				dataMeta := meta.MustDataMeta()
-				return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().ContainsKey(vals[0]), nil
-			}
-			blockFilterOp = func(
-				blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
-			) (bool, bool, error) {
-				var (
-					can, ok bool
-				)
-				zm := blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap()
-				if isSorted {
-					can = !zm.AnyLEByValue(vals[0])
-					if can {
-						ok = false
-					} else {
-						ok = zm.ContainsKey(vals[0])
-					}
+				can = !zm.AnyLEByValue(vals[0])
+				if can {
+					ok = false
 				} else {
-					can = false
 					ok = zm.ContainsKey(vals[0])
 				}
-				if !ok {
-					return can, ok, nil
-				}
-				if isPK {
-					blkBf := bf.GetBloomFilter(uint32(blkIdx))
-					blkBfIdx := index.NewEmptyBinaryFuseFilter()
-					if err := index.DecodeBloomFilter(blkBfIdx, blkBf); err != nil {
-						return false, false, err
-					}
-					exist, err := blkBfIdx.MayContainsKey(vals[0])
-					if err != nil || !exist {
-						return false, false, err
-					}
-				}
-				return false, true, nil
+			} else {
+				can = false
+				ok = zm.ContainsKey(vals[0])
 			}
-			if isSorted {
-				seekOp = func(meta objectio.ObjectDataMeta) int {
-					blockCnt := int(meta.BlockCount())
-					blkIdx := sort.Search(blockCnt, func(j int) bool {
-						return meta.GetBlockMeta(uint32(j)).MustGetColumn(uint16(seqNum)).ZoneMap().AnyGEByValue(vals[0])
-					})
-					return blkIdx
+			if !ok {
+				return can, ok, nil
+			}
+			if isPK {
+				blkBf := bf.GetBloomFilter(uint32(blkIdx))
+				blkBfIdx := index.NewEmptyBinaryFuseFilter()
+				if err := index.DecodeBloomFilter(blkBfIdx, blkBf); err != nil {
+					return false, false, err
+				}
+				exist, err := blkBfIdx.MayContainsKey(vals[0])
+				if err != nil || !exist {
+					return false, false, err
 				}
 			}
-		default:
+			return false, true, nil
+		}
+		if isSorted {
+			seekOp = func(meta objectio.ObjectDataMeta) int {
+				blockCnt := int(meta.BlockCount())
+				blkIdx := sort.Search(blockCnt, func(j int) bool {
+					return meta.GetBlockMeta(uint32(j)).MustGetColumn(uint16(seqNum)).ZoneMap().AnyGEByValue(vals[0])
+				})
+				return blkIdx
+			}
+		}
+	case "prefix_in":
+		colExpr, val, ok := mustColVecValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
+		if !ok {
 			canCompile = false
+			return
+		}
+		vec := vector.NewVec(types.T_any.ToType())
+		_ = vec.UnmarshalBinary(val)
+		colDef := getColDefByName(colExpr.Col.Name, tableDef)
+		_, isSorted := isSortedKey(colDef)
+		if isSorted {
+			fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
+				if obj.ZMIsEmpty() {
+					return true, nil
+				}
+				return obj.SortKeyZoneMap().PrefixIn(vec), nil
+			}
+		}
+		loadOp = loadMetadataOnlyOpFactory(fs)
+
+		seqNum := colDef.Seqnum
+		objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
+			if isSorted {
+				return true, nil
+			}
+			dataMeta := meta.MustDataMeta()
+			return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixIn(vec), nil
+		}
+		blockFilterOp = func(
+			_ int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
+		) (bool, bool, error) {
+			// TODO: define canQuickBreak
+			if !blkMeta.IsEmpty() && !blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().PrefixIn(vec) {
+				return false, false, nil
+			}
+			return false, true, nil
+		}
+	case "in":
+		colExpr, val, ok := mustColVecValueFromBinaryFuncExpr(exprImpl, tableDef, proc)
+		if !ok {
+			canCompile = false
+			return
+		}
+		vec := vector.NewVec(types.T_any.ToType())
+		_ = vec.UnmarshalBinary(val)
+		colDef := getColDefByName(colExpr.Col.Name, tableDef)
+		isPK, isSorted := isSortedKey(colDef)
+		if isSorted {
+			fastFilterOp = func(obj objectio.ObjectStats) (bool, error) {
+				if obj.ZMIsEmpty() {
+					return true, nil
+				}
+				return obj.SortKeyZoneMap().AnyIn(vec), nil
+			}
+		}
+		if isPK {
+			loadOp = loadMetadataAndBFOpFactory(fs)
+		} else {
+			loadOp = loadMetadataOnlyOpFactory(fs)
+		}
+
+		seqNum := colDef.Seqnum
+		objectFilterOp = func(meta objectio.ObjectMeta, _ objectio.BloomFilter) (bool, error) {
+			if isSorted {
+				return true, nil
+			}
+			dataMeta := meta.MustDataMeta()
+			return dataMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyIn(vec), nil
+		}
+		blockFilterOp = func(
+			blkIdx int, blkMeta objectio.BlockObject, bf objectio.BloomFilter,
+		) (bool, bool, error) {
+			// TODO: define canQuickBreak
+			if !blkMeta.MustGetColumn(uint16(seqNum)).ZoneMap().AnyIn(vec) {
+				return false, false, nil
+			}
+			if isPK {
+				blkBf := bf.GetBloomFilter(uint32(blkIdx))
+				blkBfIdx := index.NewEmptyBinaryFuseFilter()
+				if err := index.DecodeBloomFilter(blkBfIdx, blkBf); err != nil {
+					return false, false, err
+				}
+				if exist := blkBfIdx.MayContainsAny(vec); !exist {
+					return false, false, nil
+				}
+			}
+			return false, true, nil
 		}
 	default:
 		canCompile = false
 	}
+
 	return
 }
 
@@ -899,10 +450,6 @@ func ExecuteBlockFilter(
 				pos = seekOp(dataMeta)
 			}
 
-			if objStats.Rows() == 0 {
-				logutil.Fatalf("object stats has zero rows, detail: %s", obj.String())
-			}
-
 			for ; pos < blockCnt; pos++ {
 				var blkMeta objectio.BlockObject
 				if dataMeta != nil && blockFilterOp != nil {
@@ -923,36 +470,16 @@ func ExecuteBlockFilter(
 						continue
 					}
 				}
-				var rows uint32
-				if objRows := objStats.Rows(); objRows != 0 {
-					if pos < blockCnt-1 {
-						rows = options.DefaultBlockMaxRows
-					} else {
-						rows = objRows - options.DefaultBlockMaxRows*uint32(pos)
-					}
-				} else {
-					if blkMeta == nil {
-						blkMeta = dataMeta.GetBlockMeta(uint32(pos))
-					}
-					rows = blkMeta.GetRows()
-				}
+				var rows = blkMeta.GetRows()
 				loc := objectio.BuildLocation(name, extent, rows, uint16(pos))
 				blk := objectio.BlockInfo{
-					BlockID:   *objectio.BuildObjectBlockid(name, uint16(pos)),
-					SegmentID: name.SegmentId(),
-					MetaLoc:   objectio.ObjectLocation(loc),
+					BlockID: *objectio.BuildObjectBlockid(name, uint16(pos)),
+					MetaLoc: objectio.ObjectLocation(loc),
 				}
 
 				blk.Sorted = obj.Sorted
 				blk.EntryState = obj.EntryState
 				blk.CommitTs = obj.CommitTS
-				if obj.HasDeltaLoc {
-					deltaLoc, commitTs, ok := snapshot.GetBockDeltaLoc(blk.BlockID)
-					if ok {
-						blk.DeltaLoc = deltaLoc
-						blk.CommitTs = commitTs
-					}
-				}
 
 				if hasDeletes {
 					if _, ok := dirtyBlocks[blk.BlockID]; !ok {
@@ -974,4 +501,40 @@ func ExecuteBlockFilter(
 		uncommittedObjects...,
 	)
 	return
+}
+
+//-----------------------------------------
+
+func mustColConstValueFromBinaryFuncExpr(
+	expr *plan.Expr_F, tableDef *plan.TableDef, proc *process.Process,
+) (*plan.Expr_Col, [][]byte, bool) {
+	panic("")
+}
+
+func getColDefByName(name string, tableDef *plan.TableDef) *plan.ColDef {
+	panic("")
+	//idx := strings.Index(name, ".")
+	//var pos int32
+	//if idx >= 0 {
+	//	subName := name[idx+1:]
+	//	pos = tableDef.Name2ColIndex[subName]
+	//} else {
+	//	pos = tableDef.Name2ColIndex[name]
+	//}
+	//return tableDef.Cols[pos]
+}
+
+func isSortedKey(colDef *plan.ColDef) (isPK, isSorted bool) {
+	//if colDef.Name == catalog.FakePrimaryKeyColName {
+	//	return false, false
+	//}
+	//isPK, isCluster := colDef.Primary, colDef.ClusterBy
+	//isSorted = isPK || isCluster
+	return
+}
+
+func mustColVecValueFromBinaryFuncExpr(
+	expr *plan.Expr_F, tableDef *plan.TableDef, proc *process.Process,
+) (*plan.Expr_Col, []byte, bool) {
+	panic("")
 }

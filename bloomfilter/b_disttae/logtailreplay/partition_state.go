@@ -11,12 +11,29 @@ type PartitionState struct {
 	dataObjects           *btree.BTreeG[ObjectEntry]
 	dataObjectsByCreateTS *btree.BTreeG[ObjectIndexByCreateTSEntry]
 	blockDeltas           *btree.BTreeG[BlockDeltaEntry]
-	checkpoints           []string
 	primaryIndex          *btree.BTreeG[*PrimaryIndexEntry]
 	dirtyBlocks           *btree.BTreeG[types.Blockid]
 	objectIndexByTS       *btree.BTreeG[ObjectIndexByTSEntry]
-	noData                bool
-	minTS                 types.TS
+
+	checkpoints []string
+	noData      bool
+	minTS       types.TS
+}
+
+type RowEntry struct{}
+
+type ObjectEntry struct{}
+
+type ObjectIndexByCreateTSEntry struct {
+}
+
+type BlockDeltaEntry struct {
+}
+
+type PrimaryIndexEntry struct {
+}
+
+type ObjectIndexByTSEntry struct {
 }
 
 type ObjectInfo struct {
