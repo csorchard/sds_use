@@ -1,7 +1,7 @@
 package logtailreplay
 
 import (
-	"github.com/tidwall/btree"
+	btree "github.com/tidwall/btree"
 	"sds_use/bloomfilter/containers/types"
 	"sds_use/bloomfilter/objectio"
 )

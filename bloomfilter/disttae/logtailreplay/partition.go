@@ -14,3 +14,7 @@ type Partition struct {
 	// assuming checkpoints will be consumed once
 	checkpointConsumed atomic.Bool
 }
+
+func (p *Partition) Snapshot() *PartitionState {
+	panic("")
+}

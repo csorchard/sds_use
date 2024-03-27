@@ -24,6 +24,7 @@ type txnTable struct {
 	proc           atomic.Pointer[process.Process]
 	_partState     atomic.Pointer[logtailreplay.PartitionState]
 	logtailUpdated atomic.Bool
+	tableId        uint64
 }
 
 // txn can read :
