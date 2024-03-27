@@ -7,6 +7,35 @@ import (
 
 type BlockInfoSlice []byte
 
+func (s *BlockInfoSlice) GetBytes(i int) []byte {
+	panic("implement me")
+}
+
+func (s *BlockInfoSlice) Append(bytes []byte) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *BlockInfoSlice) Size() int {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *BlockInfoSlice) SetBytes(bytes []byte) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *BlockInfoSlice) GetAllBytes() []byte {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *BlockInfoSlice) Slice(i, j int) []byte {
+	//TODO implement me
+	panic("implement me")
+}
+
 func (s *BlockInfoSlice) AppendBlockInfo(info BlockInfo) {
 	*s = append(*s, EncodeBlockInfo(info)...)
 }

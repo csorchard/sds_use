@@ -8,16 +8,22 @@ import (
 	"sds_use/bloomfilter/fileservice"
 	"sds_use/bloomfilter/objectio"
 	"sds_use/bloomfilter/pb/plan"
+	"sds_use/bloomfilter/process"
+	"sds_use/bloomfilter/sql/colexec"
 	"sds_use/bloomfilter/tae/blockio"
 	"sds_use/bloomfilter/tae/index"
+	"sds_use/bloomfilter/vm/engine"
 	"sort"
-	"time"
+	"sync/atomic"
 )
 
 type txnTable struct {
-	primaryIdx int
-	tableDef   *plan.TableDef
-	db         *txnDatabase
+	primaryIdx     int
+	tableDef       *plan.TableDef
+	db             *txnDatabase
+	proc           atomic.Pointer[process.Process]
+	_partState     atomic.Pointer[logtailreplay.PartitionState]
+	logtailUpdated atomic.Bool
 }
 
 // txn can read :
@@ -37,40 +43,6 @@ type txnTable struct {
 
 // return all unmodified blocks
 func (tbl *txnTable) Ranges(ctx context.Context, exprs []*plan.Expr) (ranges engine.Ranges, err error) {
-	start := time.Now()
-
-	seq := tbl.db.txn.op.NextSequence()
-	trace.GetService().AddTxnDurationAction(
-		tbl.db.txn.op,
-		client.RangesEvent,
-		seq,
-		tbl.tableId,
-		0,
-		nil)
-
-	defer func() {
-		cost := time.Since(start)
-
-		trace.GetService().AddTxnAction(
-			tbl.db.txn.op,
-			client.RangesEvent,
-			seq,
-			tbl.tableId,
-			int64(ranges.Len()),
-			"blocks",
-			err)
-
-		trace.GetService().AddTxnDurationAction(
-			tbl.db.txn.op,
-			client.RangesEvent,
-			seq,
-			tbl.tableId,
-			cost,
-			err)
-
-		v2.TxnTableRangeDurationHistogram.Observe(cost.Seconds())
-	}()
-
 	// make sure we have the block infos snapshot
 	if err = tbl.UpdateObjectInfos(ctx); err != nil {
 		return
@@ -122,7 +94,7 @@ func (tbl *txnTable) rangesOnePart(
 		return nil
 	}
 
-	if done, err = tbl.tryFastRanges(
+	if done, err := tbl.tryFastRanges(
 		exprs, state, uncommittedObjects, dirtyBlks, outBlocks, tbl.db.txn.engine.fs,
 	); err != nil {
 		return err
@@ -130,14 +102,13 @@ func (tbl *txnTable) rangesOnePart(
 		return nil
 	}
 
-	// for dynamic parameter, substitute param ref and const fold cast expression here to improve performance
-	newExprs, err := plan.ConstandFoldList(exprs, tbl.proc.Load(), true)
-	if err == nil {
-		exprs = newExprs
-	}
+	//// for dynamic parameter, substitute param ref and const fold cast expression here to improve performance
+	//newExprs, err := plan.ConstandFoldList(exprs, tbl.proc.Load(), true)
+	//if err == nil {
+	//	exprs = newExprs
+	//}
 
 	var (
-		objMeta  objectio.ObjectMeta
 		zms      []objectio.ZoneMap
 		vecs     []*vector.Vector
 		skipObj  bool
@@ -153,21 +124,8 @@ func (tbl *txnTable) rangesOnePart(
 		}
 	}()
 
-	// check if expr is monotonic, if not, we can skip evaluating expr for each block
-	for _, expr := range exprs {
-		auxIdCnt += plan.AssignAuxIdForExpr(expr, auxIdCnt)
-	}
-
-	columnMap := make(map[int]int)
-	if auxIdCnt > 0 {
-		zms = make([]objectio.ZoneMap, auxIdCnt)
-		vecs = make([]*vector.Vector, auxIdCnt)
-		plan.GetColumnMapByExprs(exprs, tableDef, columnMap)
-	}
-
-	errCtx := errutil.ContextWithNoReport(ctx, true)
-
 	hasDeletes := len(dirtyBlks) > 0
+	columnMap := make(map[int]int)
 
 	if err = ForeachSnapshotObjects(
 		tbl.db.txn.op.SnapshotTS(),
@@ -176,40 +134,8 @@ func (tbl *txnTable) rangesOnePart(
 			skipObj = false
 
 			s3BlkCnt += obj.BlkCnt()
-			if auxIdCnt > 0 {
-				v2.TxnRangesLoadedObjectMetaTotalCounter.Inc()
-				location := obj.ObjectLocation()
-				if objMeta, err2 = objectio.FastLoadObjectMeta(
-					errCtx, &location, false, tbl.db.txn.engine.fs,
-				); err2 != nil {
-					return
-				}
-
-				meta = objMeta.MustDataMeta()
-				// here we only eval expr on the object meta if it has more than one blocks
-				if meta.BlockCount() > 2 {
-					for _, expr := range exprs {
-						if !colexec.EvaluateFilterByZoneMap(
-							errCtx, proc, expr, meta, columnMap, zms, vecs,
-						) {
-							skipObj = true
-							break
-						}
-					}
-				}
-			}
 			if skipObj {
 				return
-			}
-
-			if obj.Rows() == 0 && meta.IsEmpty() {
-				location := obj.ObjectLocation()
-				if objMeta, err2 = objectio.FastLoadObjectMeta(
-					errCtx, &location, false, tbl.db.txn.engine.fs,
-				); err2 != nil {
-					return
-				}
-				meta = objMeta.MustDataMeta()
 			}
 
 			ForeachBlkInObjStatsList(true, meta, func(blk objectio.BlockInfo, blkMeta objectio.BlockObject) bool {
@@ -218,7 +144,7 @@ func (tbl *txnTable) rangesOnePart(
 				if auxIdCnt > 0 {
 					// eval filter expr on the block
 					for _, expr := range exprs {
-						if !colexec.EvaluateFilterByZoneMap(errCtx, proc, expr, blkMeta, columnMap, zms, vecs) {
+						if !colexec.EvaluateFilterByZoneMap(proc, expr, blkMeta, columnMap, zms, vecs) {
 							skipBlk = true
 							break
 						}
@@ -233,13 +159,6 @@ func (tbl *txnTable) rangesOnePart(
 				blk.Sorted = obj.Sorted
 				blk.EntryState = obj.EntryState
 				blk.CommitTs = obj.CommitTS
-				if obj.HasDeltaLoc {
-					deltaLoc, commitTs, ok := state.GetBockDeltaLoc(blk.BlockID)
-					if ok {
-						blk.DeltaLoc = deltaLoc
-						blk.CommitTs = commitTs
-					}
-				}
 
 				if hasDeletes {
 					if _, ok := dirtyBlks[blk.BlockID]; !ok {
@@ -268,13 +187,7 @@ func (tbl *txnTable) rangesOnePart(
 	}
 
 	bhit, btotal := outBlocks.Len()-1, int(s3BlkCnt)
-	v2.TaskSelBlockTotal.Add(float64(btotal))
-	v2.TaskSelBlockHit.Add(float64(btotal - bhit))
 	blockio.RecordBlockSelectivity(bhit, btotal)
-	if btotal > 0 {
-		v2.TxnRangeSizeHistogram.Observe(float64(bhit))
-		v2.TxnRangesBlockSelectivityHistogram.Observe(float64(bhit) / float64(btotal))
-	}
 	return
 }
 
@@ -416,5 +329,124 @@ func (tbl *txnTable) tryFastRanges(
 
 	blockio.RecordBlockSelectivity(bhit, btotal)
 
+	return
+}
+
+func (tbl *txnTable) collectUnCommittedObjects() []objectio.ObjectStats {
+	return nil
+}
+
+func (tbl *txnTable) collectDirtyBlocks(
+	state *logtailreplay.PartitionState,
+	uncommittedObjects []objectio.ObjectStats) map[types.Blockid]struct{} {
+	return nil
+}
+
+// tryFastFilterBlocks is going to replace the tryFastRanges completely soon, in progress now.
+func (tbl *txnTable) tryFastFilterBlocks(
+	exprs []*plan.Expr,
+	snapshot *logtailreplay.PartitionState,
+	uncommittedObjects []objectio.ObjectStats,
+	dirtyBlocks map[types.Blockid]struct{},
+	outBlocks *objectio.BlockInfoSlice,
+	fs fileservice.FileService) (done bool, err error) {
+	return false, nil
+}
+
+func (tbl *txnTable) GetTableDef(ctx context.Context) *plan.TableDef {
+	return nil
+}
+
+// get the table's snapshot.
+// it is only initialized once for a transaction and will not change.
+func (tbl *txnTable) getPartitionState(ctx context.Context) (*logtailreplay.PartitionState, error) {
+	if tbl._partState.Load() == nil {
+		if err := tbl.updateLogtail(ctx); err != nil {
+			return nil, err
+		}
+		tbl._partState.Store(tbl.db.txn.engine.getPartition(tbl.db.databaseId, tbl.tableId).Snapshot())
+	}
+	return tbl._partState.Load(), nil
+}
+
+func (tbl *txnTable) updateLogtail(ctx context.Context) (err error) {
+	defer func() {
+		if err == nil {
+			//tbl.db.txn.engine.globalStats.notifyLogtailUpdate(tbl.tableId)
+			tbl.logtailUpdated.Store(true)
+		}
+	}()
+	// if the logtail is updated, skip
+	if tbl.logtailUpdated.Load() {
+		return
+	}
+
+	// if the table is created in this txn, skip
+	//accountId, err := defines.GetAccountId(ctx)
+	//if err != nil {
+	//	return err
+	//}
+	//if _, created := tbl.db.txn.createMap.Load(
+	//	genTableKey(accountId, tbl.tableName, tbl.db.databaseId)); created {
+	//	return
+	//}
+	//
+	//tableId := tbl.tableId
+	/*
+		if the table is truncated once or more than once,
+		it is suitable to use the old table id to sync logtail.
+
+		CORNER CASE 1:
+		create table t1(a int);
+		begin;
+		truncate t1; //table id changed. there is no new table id in DN.
+		select count(*) from t1; // sync logtail for the new id failed.
+
+		CORNER CASE 2:
+		create table t1(a int);
+		begin;
+		select count(*) from t1; // sync logtail for the old succeeded.
+		truncate t1; //table id changed. there is no new table id in DN.
+		select count(*) from t1; // not sync logtail this time.
+
+		CORNER CASE 3:
+		create table t1(a int);
+		begin;
+		truncate t1; //table id changed. there is no new table id in DN.
+		truncate t1; //table id changed. there is no new table id in DN.
+		select count(*) from t1; // sync logtail for the new id failed.
+	*/
+	//if tbl.oldTableId != 0 {
+	//	tableId = tbl.oldTableId
+	//}
+	//
+	//if err = tbl.db.txn.engine.UpdateOfPush(ctx, tbl.db.databaseId, tableId, tbl.db.txn.op.SnapshotTS()); err != nil {
+	//	return
+	//}
+	//if _, err = tbl.db.txn.engine.lazyLoad(ctx, tbl); err != nil {
+	//	return
+	//}
+
+	return nil
+}
+
+func (tbl *txnTable) UpdateObjectInfos(ctx context.Context) (err error) {
+	//tbl.tnList = []int{0}
+	//
+	//accountId, err := defines.GetAccountId(ctx)
+	//if err != nil {
+	//	return err
+	//}
+	//_, created := tbl.db.txn.createMap.Load(genTableKey(accountId, tbl.tableName, tbl.db.databaseId))
+	//// check if the table is not created in this txn, and the block infos are not updated, then update:
+	//// 1. update logtail
+	//// 2. generate block infos
+	//// 3. update the blockInfosUpdated and blockInfos fields of the table
+	//if !created && !tbl.objInfosUpdated.Load() {
+	//	if err = tbl.updateLogtail(ctx); err != nil {
+	//		return
+	//	}
+	//	tbl.objInfosUpdated.Store(true)
+	//}
 	return
 }

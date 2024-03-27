@@ -19,3 +19,7 @@ func NewVec(typ types.Type) *Vector {
 func (v *Vector) UnmarshalBinary(data []byte) error {
 	return nil
 }
+
+func (v *Vector) Free(mp any) {
+
+}
